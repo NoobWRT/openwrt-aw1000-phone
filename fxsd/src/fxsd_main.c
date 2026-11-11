@@ -110,7 +110,7 @@ static char block[LIST_MAX][CLCC_NUM_MAX], allow[LIST_MAX][CLCC_NUM_MAX];
 static int nspeed, nblock, nallow;
 static char outgoing[LIST_MAX][32];
 static int noutgoing, outgoing_mode;
-static int voice_off, svc_known, svc_lost;
+static int voice_off, svc_known, svc_lost, modem_mute;
 static int sip_on, sip_16k, client, phone_off;
 static const char *sip_name = "";
 
@@ -652,6 +652,24 @@ static void rec_end(struct fxsd *d)
 	rec_write_state();
 }
 
+/*
+ * A modem call with no sample above the noise floor means the modem is not sending audio on the
+ * PCM bus at all (wrong interface, master mode, USB voice on). Even a quiet line has comfort
+ * noise. Calls shorter than MUTE_TICKS bridge ticks (about 4 s) are not judged. The warning
+ * shows on the Status page until a call has sound again.
+ */
+#define MUTE_TICKS	5000
+#define MUTE_PEAK	4
+
+static void check_modem_audio(uint32_t ticks, uint32_t peak)
+{
+	if (ticks < MUTE_TICKS)
+		return;
+	if (peak <= MUTE_PEAK && !modem_mute)
+		msg(LOG_WARNING, "the call got no audio from the modem; check AT+QAUDCFG=\"pcmidx\" (1), AT+QDAI (slave) and AT+QPCMV (0)");
+	modem_mute = peak <= MUTE_PEAK;
+}
+
 static void apply_bridge(struct fxsd *d)
 {
 	int want = d->sip_audio ? 2 : d->audio ? 1 : 0;
@@ -662,9 +680,12 @@ static void apply_bridge(struct fxsd *d)
 	if (d->bridge) {
 		uint32_t st[6];
 
-		if (!fxsdev_stat(&d->s, st))
+		if (!fxsdev_stat(&d->s, st)) {
 			msg(LOG_INFO, "audio moved %u, resync %u, ticks %u, status 0x%x, peak modem %u, phone %u",
 			    st[0], st[1], st[2], st[3], st[4], st[5]);
+			if (d->bridge == 1)
+				check_modem_audio(st[2], st[4]);
+		}
 	}
 	if (rec_open && (!want || (want == 2) != (rec_open == REC_SRC_SIP + 1)))
 		rec_end(d);
@@ -1071,11 +1092,11 @@ static void write_state(struct fxsd *d)
 
 	if (!f)
 		return;
-	fprintf(f, "state=%s\npeer=%s\noffhook=%d\nvbat=%d\nvline=%d\niloop=%d\nown=%s\ntest=%d\nvoiceoff=%d\nsince=%ld\nhd=%d\nsip=%d\nsipcall=%d\ndnd=%d\nsilent=%d\nphone=%d\nservice=%d\nquiet=%d\nquiet_until=%ld\n",
+	fprintf(f, "state=%s\npeer=%s\noffhook=%d\nvbat=%d\nvline=%d\niloop=%d\nown=%s\ntest=%d\nvoiceoff=%d\nsince=%ld\nhd=%d\nsip=%d\nsipcall=%d\ndnd=%d\nsilent=%d\nphone=%d\nservice=%d\nquiet=%d\nquiet_until=%ld\nmodemmute=%d\n",
 		line_state_name(d->line.state), d->line.peer, d->line.offhook,
 		d->vbat_mv, d->vline_mv, d->iloop_ua, own_number, d->test_ring, voice_off, d->talk_since, d->wb,
 		sip_on ? (client ? 2 : 1) : 0, d->sip_audio, dnd_mode() >= 0, d->silent, d->phone,
-		svc_known ? !d->line.no_service : -1, quiet_on, quiet_on ? quiet_until : 0L);
+		svc_known ? !d->line.no_service : -1, quiet_on, quiet_on ? quiet_until : 0L, modem_mute);
 	fclose(f);
 	rename(STATE_FILE ".tmp", STATE_FILE);
 }
@@ -1474,6 +1495,44 @@ static void check_voice(void)
 	voice_off = *p == '1';
 	if (voice_off)
 		msg(LOG_WARNING, "voice calls are turned off in the modem; run AT+QCFG=\"call_control\",0,0 and restart the modem");
+}
+
+/*
+ * The RG500Q's PCM interface 1 is the one wired to the router's PCM bus. Setups that carry call
+ * audio over USB (AT+QPCMV, as with QModem) move it to interface 2 to keep the modem off the bus,
+ * and the modem saves that. Then calls connect, but the audio goes to pins nothing is wired to.
+ * AT+QDAI applies to the interface in use when it is set, so after the switch interface 1 is
+ * still in master mode and garbles the audio until QDAI is set again and the modem restarts.
+ * Returns 1 when it switched the interface.
+ */
+static int fix_pcm_iface(void)
+{
+	char r[512];
+	int i;
+
+	if (modem_at("AT+QAUDCFG=\"pcmidx\"", r, sizeof(r)) || (i = qaudcfg_pcmidx(r)) < 0 || i == 1)
+		return 0;
+	msg(LOG_WARNING, "modem PCM was on interface %d, which is not wired to the phone; switching it to 1", i);
+	at("AT+QAUDCFG=\"pcmidx\",1");
+	return 1;
+}
+
+/*
+ * AT+QPCMV=1 sends call audio over USB instead of PCM (the old QModem RJ11 scripts use it), so
+ * the phone gets nothing. The modem forgets it on restart, but the old rj11 service turns it on
+ * again before every call, so warn when that service is still installed.
+ */
+static void fix_usb_voice(void)
+{
+	char r[512];
+	int on;
+
+	if (!access("/etc/init.d/rj11", F_OK))
+		msg(LOG_WARNING, "the old rj11 phone service is installed; it sends call audio over USB, remove it");
+	if (modem_at("AT+QPCMV?", r, sizeof(r)) || (on = qpcmv_on(r)) != 1)
+		return;
+	msg(LOG_WARNING, "modem call audio was going over USB (AT+QPCMV=1), turning it off");
+	at("AT+QPCMV=0");
 }
 
 static void switch_rate(int hd);
@@ -1963,7 +2022,7 @@ int main(int argc, char **argv)
 		unlink(STATE_FILE);
 		return 0;
 	}
-	if ((q = modem_rate()) >= 0 && q != hd) {
+	if (fix_pcm_iface() || ((q = modem_rate()) >= 0 && q != hd)) {
 		switch_rate(hd);
 		if (wait_modem(hd)) {
 			unlink(STATE_FILE);
@@ -1977,6 +2036,7 @@ int main(int argc, char **argv)
 	read_own_number();
 	local_numbers(numfmt);
 	check_voice();
+	fix_usb_voice();
 	if (vol >= 0 && vol <= 5) {
 		snprintf(r, sizeof(r), "AT+CLVL=%d", vol);
 		at(r);
